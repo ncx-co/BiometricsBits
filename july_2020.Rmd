@@ -1,0 +1,146 @@
+---
+title: "Ecoregion vs Landsat FIA comparison"
+author: "SilviaTerra, LLC"
+date: "`r as.character(format(Sys.time(), format = '%B %d %Y %X'))`"
+output: html_document
+params:
+  jobslug: !r NULL
+---
+
+This script accompanies the July 2020 Biometrics Bits column, and illustrates how to use tidyFIA and rFIA for a common task: estimating stocking for the Laurentian Mixed Forest ecoregion in northern Minnesota & Wisconsin.
+
+First, we'll install both packages. The rFIA package can be installed directly from CRAN, while currently tidyFIA must be installed from GitHub. We'll also load two other packages that we'll use for this analysis, tidyverse and sf. If you don't have these installed, you can do so using the same command as we use for rFIA.
+
+```{r libraries, echo=FALSE}
+install.packages('rFIA')
+remotes::install_github("SilviaTerra/tidyFIA")
+
+library(rFIA)
+library(tidyFIA)
+library(tidyverse)
+library(sf)
+library(ggplot2)
+```
+
+Now, we will create a shapefile to define the area of interest for querying the FIA database. We will download this file directly from the url below, then use the st_read() command to read it into our R session.
+
+```{r ssection}
+download.file(
+    url = "https://www.arb.ca.gov/cc/capandtrade/protocols/usforest/2014/supersectionshapefiles/gis-supersection-shape-file.zip",
+    destfile = "/tmp/gis-supersection-shape-file.zip"
+)
+
+unzip(
+  zipfile = "/tmp/gis-supersection-shape-file.zip",
+  exdir = "/tmp/super"
+)
+
+superFile <- "/tmp/super/Supersections/Supersections.shp"
+
+supersectionShape <- st_read(superFile) %>%
+                      st_transform(crs = 2163)
+
+glimpse(supersectionShape)
+```
+
+The SSection field is a unique supersection identifier, so we'll use that to filter down to our target region. The '%>%' is the "pipe" symbol used in tidy data analysis, and it is a convenient way to string multiple operations together into readable chunks of code. Here, we will use it to "pipe" in a filter() command that will select the polygon we want. The next command summarise() is a convenient way of dissolving multiple polygons.
+
+```{r aoi}
+aoi <- supersectionShape %>%
+       filter(SSection == 'Laurentian Mixed Forest Arrowhead')
+
+ggplot() +
+   geom_sf(data = us_states %>% filter(NAME == 'Minnesota')) +
+   geom_sf(data = aoi,
+           color = 'blue')
+
+```
+
+Now let's pull in the FIA data using each package. One of the advantaages of tidyFIA is that it is configured to query a PostGIS database version of the FIA data maintained by SilviaTerra, which allows for much faster querying. This also means we can query directly with the shapefile we built above, while with rFIA it is a two step process: (1) download the data for all states; (2) clip to the shapefile. This isn't that big of a deal, but the direct querying is faster and saves of the trouble of having to know all of the states our aoi overlaps with. To compare, we'll record the time it takes to download and prep the data for each approach.
+
+Note that you need a password to use the database version of tidyFIA, which can be obtained by emailing Brian Clough (brian@silviaterra.com) or Henry Rodman (henry@silviaterra.com). Otherwise, you can set postgis = FALSE and tidyFIA will download the full state tables.
+
+```{r query}
+time_1 <- Sys.time()
+  tidyfia_data <- tidy_fia(aoi = aoi, postgis = TRUE)
+time_2 <- Sys.time()
+
+time_3 <- Sys.time()
+  rfia_data_raw <- getFIA(states = 'MN')
+  rfia_data <- clipFIA(rfia_data_raw, mask = aoi, mostRecent = FALSE)
+time_4 <- Sys.time()
+
+message(glue::glue('tidyFIA runtime: {time_2 - time_1}'))
+message(glue::glue('rFIA runtime: {time_4 - time_3}'))
+```
+
+As you can, tidyFIA is a lot faster. We built it to do fast querying so we could use it in production without adding a lot of overhead when running many queries. As we'll see, however, rFIA has a number of built in functions that are quite convenient. To illustrate, let's look at the steps required to a set of trees per acre estimates by plot for all measurements from 2010 on.
+
+```{r rfia_tpa}
+
+rfia_plots <- tpa(rfia_data, byPlot = TRUE) %>%
+            filter(YEAR >= 2010)
+
+glimpse(rfia_plots)
+```
+
+Now let's produce a similar table using the output from tidyFIA.
+
+```{r tidyfia_tpa}
+
+tidyfia_plots <- tidyfia_data[["tree"]] %>%
+              group_by(plt_cn) %>%
+              summarize(
+                bapa = sum(tpa_unadj * 0.005454 * dia ^ 2, na.rm = TRUE),
+                tpa = sum(tpa_unadj, na.rm = TRUE),
+                qmd = sqrt(bapa / tpa / 0.005454)
+              ) %>%
+              full_join(
+                tidyfia_data[["plot"]] %>% select(cn, invyr),
+                by = c("plt_cn" = "cn")
+              ) %>%
+              replace_na(replace = list(bapa = 0, tpa = 0, qmd = 0)) %>%
+              filter(invyr >= 2010)
+
+glimpse(tidyfia_plots)
+```
+
+As you can see, this is much more verbose and requires pretty good knowledge of the tidyverse. Of course, if you're familiar with tidy data methods or eager learn, there's a lot greater flexibility you can have in terms of manipulating the data, applying custom models, etc. It all depends on your analysis & goals.
+
+rFIA pulls in an additional 100 or so plots, suggesting there's something a bit different going on under the hood of the two packages. Still, these samples ought to be pretty comparable. Let's check it out.
+
+```{r comp_frame}
+
+comp_frame <- bind_rows(
+               rfia_plots %>%
+                 transmute(plt_cn = as.character(PLT_CN),
+                           tpa = TPA,
+                           source = 'rFIA'),
+               tidyfia_plots %>%
+                  transmute(plt_cn,
+                            tpa,
+                            source = 'tidyFIA')
+               )
+
+ggplot(comp_frame, aes(x = tpa, color = source)) +
+      geom_density() +
+      theme_bw() +
+      xlab("Density of plot TPA from the two packages")
+
+tidyfia_plots %>%
+  pivot_longer(
+    cols = c("bapa", "tpa", "qmd"),
+    names_to = "attribute",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(x = invyr, y = value)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth() +
+  facet_wrap(~ attribute, scales = "free")
+```
+
+As you can see, not identical, but very close.
+
+This is really just scratching the surface of what you can do with either package. Personally, I think they are both great tools and which you use really depends on what you're aiming to do with an analysis. If your goal is simply to get plot and/or population level FIA data into a form you can quickly begin to analyze, the rFIA package probably accommodates all of your needs. If you are a more experienced R developer, or if you want a high degree of customization in how you interact with the FIA data, you may like tidyFIA as a fast method for querying the FIA database and doing basic data prep.
+
+For more information, including additional examples, check out [rFIA](https://rfia.netlify.app/) and [tidyFIA](https://github.com/SilviaTerra/tidyFIA/) on the web. 
